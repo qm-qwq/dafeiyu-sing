@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
@@ -23,6 +24,7 @@ class FeiyuVoice(Star):
             config.get("base_url", "http://127.0.0.1:9880"), config.get("api_key", "")
         )
         self.directory = StarTools.get_data_dir("feiyu_voice")
+        self.pending_songs = {}
         self.state_path = self.directory / "jobs.json"
         self.jobs = (
             json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -51,6 +53,99 @@ class FeiyuVoice(Star):
     # ── 整首歌翻唱：搜歌 → 分离 → 换声 → 混音 ──────────────
     SING_SCRIPT = r"D:\shipinmoxing\feiyu_src\sing_song_win.py"
     SING_PY = r"D:\ComfyUI-aki-v2.7z\ComfyUI-aki-v2\python\python.exe"
+    SERVICE_BAT = r"D:\大肥鱼随心所欲\_feiyu_voice\start_voice.bat"
+
+    def ensure_service(self):
+        """服务离线就自己拉起来（开机自启不可靠时的兜底）"""
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:9880/v1/capabilities",
+                headers={"Authorization": "Bearer " + str(self.config.get("api_key", ""))},
+            )
+            urllib.request.urlopen(req, timeout=4)
+            return True
+        except Exception:
+            logger.warning("声音服务不在，尝试自动启动")
+            try:
+                subprocess.Popen(
+                    ["cmd.exe", "/c", self.SERVICE_BAT],
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                    close_fds=True,
+                )
+            except Exception:
+                logger.exception("自动启动声音服务失败")
+                return False
+            for _ in range(30):
+                time.sleep(2)
+                try:
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:9880/v1/capabilities",
+                        headers={"Authorization": "Bearer " + str(self.config.get("api_key", ""))},
+                    )
+                    urllib.request.urlopen(req, timeout=4)
+                    logger.info("声音服务已自动启动")
+                    return True
+                except Exception:
+                    continue
+            return False
+
+    # ── 点歌：先确认，确认了才唱 ────────────────────────
+    CONFIRM_WORDS = ("是", "对", "嗯", "好", "唱", "没错", "就这个", "就是它", "可以", "行", "唱吧", "就这首")
+    DENY_WORDS = ("不是", "不对", "错了", "换", "算了", "不要", "no", "取消")
+
+    def ask_confirm(self, event, song):
+        task = asyncio.create_task(self._preview_and_ask(event, song))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def _preview_and_ask(self, event, song):
+        origin = event.unified_msg_origin
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.SING_PY, self.SING_SCRIPT, song, "--preview",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            text = (out or b"").decode("utf-8", "replace")
+            try:
+                with open(r"D:\DafeiyuQQ\_logs\sing_debug.log", "a", encoding="utf-8") as fh:
+                    fh.write(f"\n===== [preview] {song} rc={proc.returncode} =====\n{text[-2000:]}\n")
+            except Exception:
+                pass
+            line = next((l for l in text.splitlines() if l.startswith("PREVIEW ")), None)
+            if not line:
+                await self.context.send_message(
+                    origin, MessageChain([Comp.Plain("这首歌我没找到原曲…换个名字试试？")]))
+                return
+            meta = json.loads(line[len("PREVIEW "):])
+            self.pending_songs[origin] = dict(song=song, meta=meta, ts=time.time())
+            title = (meta.get("title") or song).strip()
+            lyric = (meta.get("lyric") or "").strip()
+            dur = (meta.get("duration") or "").strip()
+            cached = meta.get("cached")
+
+            if cached:
+                msg = f"《{title}》我之前唱过，直接发给你？回「是」我就发"
+            else:
+                head = f"找到的是这首：\n{title}"
+                if dur:
+                    head += f"\n（{dur}）"
+                msg = head
+                if lyric:
+                    msg += f"\n\n歌词：「{lyric}」"
+                msg += "\n\n是这首吗？回「是」我就唱"
+            await self.context.send_message(origin, MessageChain([Comp.Plain(msg)]))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(f"preview failed: {exc}")
+            try:
+                await self.context.send_message(
+                    origin, MessageChain([Comp.Plain("我这边有点懵，再说一遍歌名好不好")]))
+            except Exception:
+                pass
 
     def sing(self, event, song):
         task = asyncio.create_task(self.deliver_song(event, song))
@@ -60,6 +155,7 @@ class FeiyuVoice(Star):
     async def deliver_song(self, event, song):
         origin = event.unified_msg_origin
         try:
+            self.ensure_service()
             proc = await asyncio.create_subprocess_exec(
                 self.SING_PY, self.SING_SCRIPT, song,
                 stdout=asyncio.subprocess.PIPE,
@@ -98,6 +194,19 @@ class FeiyuVoice(Star):
             except Exception:
                 logger.exception("sing failure notice could not be delivered")
 
+    def audio_seconds(self, path):
+        """用 ffprobe 拿音频时长"""
+        ffprobe = r"D:\shipinmoxing\bin\ffprobe.exe"
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", path],
+                capture_output=True, timeout=30,
+            )
+            return float((r.stdout or b"0").decode().strip() or 0)
+        except Exception:
+            return 0.0
+
     def split_audio(self, mp3, seconds):
         """把长音频切成若干段，规避 QQ 语音时长限制（重编码，切点准确）"""
         outdir = os.path.join(os.path.dirname(mp3), "parts")
@@ -122,17 +231,30 @@ class FeiyuVoice(Star):
         pieces = sorted(
             os.path.join(outdir, f) for f in os.listdir(outdir) if f.endswith(".mp3")
         )
-        # 合并过短的碎片（<8 秒）到前一段，避免出现 5 秒小尾巴
-        merged = []
-        for p in pieces:
-            size_ok = os.path.getsize(p) > 40_000
-            if not size_ok and merged:
-                continue
-            merged.append(p)
+        # 尾段太短（<20 秒）就并在前一段里，不然会出现几秒的小尾巴
+        if len(pieces) >= 2 and self.audio_seconds(pieces[-1]) < 20:
+            tail = pieces.pop()
+            prev = pieces.pop()
+            joined = os.path.join(outdir, "part_joined.mp3")
+            lst = os.path.join(outdir, "concat.txt")
+            with open(lst, "w", encoding="utf-8") as f:
+                for p in (prev, tail):
+                    f.write(f"file '{p.replace(chr(92), '/')}'\n")
+            r = subprocess.run(
+                [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                 "-c:a", "libmp3lame", "-qscale:a", "4", joined],
+                capture_output=True, timeout=600,
+            )
+            if r.returncode == 0 and os.path.exists(joined):
+                pieces.append(joined)
+            else:
+                pieces.extend([prev, tail])
+        merged = pieces
         return merged or [mp3]
 
     async def deliver(self, job_id, origin):
         try:
+            self.ensure_service()
             await self.client.wait(job_id)
             audio = await self.client.download(job_id, self.directory)
             chain = MessageChain(
@@ -249,6 +371,28 @@ class FeiyuVoice(Star):
         if not raw or raw.startswith("/") or raw.startswith("#"):
             return
 
+        # ① 先看有没有待确认的点歌
+        origin = event.unified_msg_origin
+        pending = self.pending_songs.get(origin)
+        if pending:
+            # 5 分钟没回就作废
+            if time.time() - pending["ts"] > 300:
+                self.pending_songs.pop(origin, None)
+            else:
+                low = raw.replace(" ", "")
+                if any(w in low for w in self.DENY_WORDS):
+                    self.pending_songs.pop(origin, None)
+                    yield event.plain_result("好吧，那换一首～")
+                    return
+                if any(w in low for w in self.CONFIRM_WORDS) and len(low) <= 8:
+                    self.pending_songs.pop(origin, None)
+                    song = pending["song"]
+                    self.sing(event, song)
+                    yield event.plain_result("好，我这就唱～")
+                    return
+                # 没说确认也没否认，就当重新点歌，清掉旧的
+                self.pending_songs.pop(origin, None)
+
         m = self.NATURAL_SPEAK.match(raw)
         if m:
             content = m.group(1).strip()
@@ -270,10 +414,11 @@ class FeiyuVoice(Star):
         s = self.NATURAL_SING.match(raw) or self.NATURAL_BIGSING.match(raw)
         if s:
             song = self.SING_TAIL.sub("", s.group(1)).strip()
+            # 只去掉书名号和引号，别碰括号（(feat. xxx) 是歌名的一部分）
             song = song.strip("《》【】\"'「」 ")
             if song and len(song) >= 2:
-                self.sing(event, song)
-                yield event.plain_result(f"《{song}》呀，好，我去找找原曲，学一会儿再唱给你听～")
+                self.ask_confirm(event, song)
+                yield event.plain_result("等我找找看是哪首～")
             return
 
     @filter.command("肥鱼换声", alias={"feiyu_rvc"})
